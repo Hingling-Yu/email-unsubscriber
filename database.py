@@ -21,6 +21,7 @@ def init_db():
         conn.execute("""
             CREATE TABLE IF NOT EXISTS subscriptions (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT NOT NULL DEFAULT '',
                 account_email       TEXT NOT NULL DEFAULT '',
                 sender_email        TEXT NOT NULL,
                 sender_name         TEXT,
@@ -31,7 +32,7 @@ def init_db():
                 error_message       TEXT,
                 found_at            TEXT NOT NULL DEFAULT (datetime('now')),
                 unsubscribed_at     TEXT,
-                UNIQUE(account_email, sender_email)
+                UNIQUE(session_id, account_email, sender_email)
             )
         """)
         _migrate(conn)
@@ -45,10 +46,13 @@ def _migrate(conn):
         row[1]
         for row in conn.execute("PRAGMA table_info(subscriptions)").fetchall()
     }
+
+    # Migration 1: add account_email column (original schema upgrade)
     if "account_email" not in cols:
         conn.execute("""
             CREATE TABLE subscriptions_new (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT NOT NULL DEFAULT 'legacy',
                 account_email       TEXT NOT NULL DEFAULT '',
                 sender_email        TEXT NOT NULL,
                 sender_name         TEXT,
@@ -59,16 +63,49 @@ def _migrate(conn):
                 error_message       TEXT,
                 found_at            TEXT NOT NULL DEFAULT (datetime('now')),
                 unsubscribed_at     TEXT,
-                UNIQUE(account_email, sender_email)
+                UNIQUE(session_id, account_email, sender_email)
             )
         """)
         conn.execute("""
             INSERT INTO subscriptions_new
-                (id, account_email, sender_email, sender_name, latest_subject,
-                 unsubscribe_method, unsubscribe_target, status, error_message,
-                 found_at, unsubscribed_at)
-            SELECT id, '', sender_email, sender_name, latest_subject,
-                   unsubscribe_method, unsubscribe_target,
+                (id, session_id, account_email, sender_email, sender_name,
+                 latest_subject, unsubscribe_method, unsubscribe_target,
+                 status, error_message, found_at, unsubscribed_at)
+            SELECT id, 'legacy', '', sender_email, sender_name,
+                   latest_subject, unsubscribe_method, unsubscribe_target,
+                   status, error_message, found_at, unsubscribed_at
+            FROM subscriptions
+        """)
+        conn.execute("DROP TABLE subscriptions")
+        conn.execute("ALTER TABLE subscriptions_new RENAME TO subscriptions")
+        return  # cols are now correct; no further migration needed
+
+    # Migration 2: add session_id column to tables that only have account_email
+    if "session_id" not in cols:
+        conn.execute("""
+            CREATE TABLE subscriptions_new (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT NOT NULL DEFAULT 'legacy',
+                account_email       TEXT NOT NULL DEFAULT '',
+                sender_email        TEXT NOT NULL,
+                sender_name         TEXT,
+                latest_subject      TEXT,
+                unsubscribe_method  TEXT NOT NULL,
+                unsubscribe_target  TEXT NOT NULL,
+                status              TEXT NOT NULL DEFAULT 'pending',
+                error_message       TEXT,
+                found_at            TEXT NOT NULL DEFAULT (datetime('now')),
+                unsubscribed_at     TEXT,
+                UNIQUE(session_id, account_email, sender_email)
+            )
+        """)
+        conn.execute("""
+            INSERT INTO subscriptions_new
+                (id, session_id, account_email, sender_email, sender_name,
+                 latest_subject, unsubscribe_method, unsubscribe_target,
+                 status, error_message, found_at, unsubscribed_at)
+            SELECT id, 'legacy', account_email, sender_email, sender_name,
+                   latest_subject, unsubscribe_method, unsubscribe_target,
                    status, error_message, found_at, unsubscribed_at
             FROM subscriptions
         """)
@@ -77,6 +114,7 @@ def _migrate(conn):
 
 
 def add_subscription(
+    session_id: str,
     account_email: str,
     sender_email: str,
     sender_name: str,
@@ -88,11 +126,11 @@ def add_subscription(
     try:
         conn.execute(
             """INSERT INTO subscriptions
-               (account_email, sender_email, sender_name, latest_subject,
-                unsubscribe_method, unsubscribe_target)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (account_email, sender_email, sender_name, latest_subject,
-             unsubscribe_method, unsubscribe_target),
+               (session_id, account_email, sender_email, sender_name,
+                latest_subject, unsubscribe_method, unsubscribe_target)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (session_id, account_email, sender_email, sender_name,
+             latest_subject, unsubscribe_method, unsubscribe_target),
         )
         conn.commit()
         return True
@@ -103,42 +141,45 @@ def add_subscription(
 
 
 def get_subscriptions(
-    account_email: str, status: Optional[str] = None
+    session_id: str,
+    account_email: str,
+    status: Optional[str] = None,
 ) -> List[Dict]:
     conn = _conn()
     try:
         if status:
             rows = conn.execute(
                 """SELECT * FROM subscriptions
-                   WHERE account_email = ? AND status = ?
+                   WHERE session_id = ? AND account_email = ? AND status = ?
                    ORDER BY found_at DESC""",
-                (account_email, status),
+                (session_id, account_email, status),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM subscriptions"
-                " WHERE account_email = ? ORDER BY found_at DESC",
-                (account_email,),
+                """SELECT * FROM subscriptions
+                   WHERE session_id = ? AND account_email = ?
+                   ORDER BY found_at DESC""",
+                (session_id, account_email),
             ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def get_subscription(sub_id: int) -> Optional[Dict]:
+def get_subscription(session_id: str, sub_id: int) -> Optional[Dict]:
+    """Return a subscription only if it belongs to this session (prevents ID enumeration)."""
     conn = _conn()
     try:
         row = conn.execute(
-            "SELECT * FROM subscriptions WHERE id = ?", (sub_id,)
+            "SELECT * FROM subscriptions WHERE id = ? AND session_id = ?",
+            (sub_id, session_id),
         ).fetchone()
         return dict(row) if row else None
     finally:
         conn.close()
 
 
-def update_status(
-    sub_id: int, status: str, error_message: Optional[str] = None
-):
+def update_status(sub_id: int, status: str, error_message: Optional[str] = None):
     conn = _conn()
     try:
         if status == "success":
@@ -150,8 +191,7 @@ def update_status(
             )
         else:
             conn.execute(
-                "UPDATE subscriptions"
-                " SET status = ?, error_message = ? WHERE id = ?",
+                "UPDATE subscriptions SET status = ?, error_message = ? WHERE id = ?",
                 (status, error_message, sub_id),
             )
         conn.commit()
@@ -160,42 +200,41 @@ def update_status(
 
 
 def find_mailto_by_address(
-    account_email: str, address: str
+    session_id: str, account_email: str, address: str
 ) -> List[Dict]:
-    """Find mailto subscriptions whose target address matches `address`.
-
-    Handles both bare addresses and `addr@host?subject=...` form.
-    """
+    """Find mailto subscriptions whose target address matches `address`."""
     addr = address.lower()
     conn = _conn()
     try:
         rows = conn.execute(
             """SELECT * FROM subscriptions
-               WHERE account_email = ?
+               WHERE session_id = ?
+                 AND account_email = ?
                  AND unsubscribe_method = 'mailto'
                  AND (
                      lower(unsubscribe_target) = ?
                      OR lower(unsubscribe_target) LIKE ?
                  )""",
-            (account_email, addr, addr + "?%"),
+            (session_id, account_email, addr, addr + "?%"),
         ).fetchall()
         return [dict(r) for r in rows]
     finally:
         conn.close()
 
 
-def count_subscriptions(account_email: str) -> int:
+def count_subscriptions(session_id: str, account_email: str) -> int:
     conn = _conn()
     try:
         return conn.execute(
-            "SELECT COUNT(*) FROM subscriptions WHERE account_email = ?",
-            (account_email,),
+            """SELECT COUNT(*) FROM subscriptions
+               WHERE session_id = ? AND account_email = ?""",
+            (session_id, account_email),
         ).fetchone()[0]
     finally:
         conn.close()
 
 
-def get_stats(account_email: str) -> Dict:
+def get_stats(session_id: str, account_email: str) -> Dict:
     conn = _conn()
     try:
         row = conn.execute("""
@@ -205,8 +244,8 @@ def get_stats(account_email: str) -> Dict:
                 SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as success,
                 SUM(CASE WHEN status = 'failed'  THEN 1 ELSE 0 END) as failed
             FROM subscriptions
-            WHERE account_email = ?
-        """, (account_email,)).fetchone()
+            WHERE session_id = ? AND account_email = ?
+        """, (session_id, account_email)).fetchone()
         return dict(row)
     finally:
         conn.close()

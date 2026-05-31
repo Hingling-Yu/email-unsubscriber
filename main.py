@@ -8,89 +8,109 @@ from html.parser import HTMLParser
 from typing import Optional
 
 import requests as http_requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 import database as db
 import gmail_client as gc
+import session as sess
 
 app = FastAPI(title="Email Unsubscriber")
 
-# Stored between /login and /callback to preserve PKCE code_verifier
-_auth_flow = None
+# Per-session OAuth flows: session_id -> Flow object.
+# Flows are short-lived (seconds between /login and /callback), so this
+# in-memory dict is sufficient; it clears on every server restart.
+_auth_flows: dict = {}
 
+
+# ── Session middleware ────────────────────────────────────────────────────────
+
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    sid = request.cookies.get(sess.SESSION_COOKIE, "")
+    if not sess.is_valid_sid(sid):
+        sid = sess.new_session_id()
+    request.state.sid = sid
+    # Only touch (disk write) on API calls; static assets don't reset inactivity
+    if request.url.path.startswith("/api/"):
+        sess.touch_session(gc.DATA_DIR, sid)
+    response = await call_next(request)
+    sess.set_session_cookie(response, sid)
+    return response
+
+
+# ── Startup ───────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
 async def startup():
     db.init_db()
-    gc.migrate_legacy_token()
+    sess.cleanup_expired_sessions(gc.DATA_DIR)
 
 
-# ---------- Status ----------
+# ── Status ────────────────────────────────────────────────────────────────────
 
 @app.get("/api/status")
 async def app_status():
     return {"credentials_configured": gc.has_credentials()}
 
 
-# ---------- Auth ----------
+# ── Auth ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/auth/status")
-async def auth_status():
-    has_creds = gc.has_credentials()
-    current = gc.get_current_account()
-    creds = gc.load_credentials()
+async def auth_status(request: Request):
+    sid = request.state.sid
+    creds = gc.load_credentials(sid)
     return {
         "authenticated": creds is not None,
-        "has_credentials": has_creds,
-        "current_account": current,
-        "accounts": gc.list_accounts(),
+        "has_credentials": gc.has_credentials(),
+        "current_account": gc.get_current_account(sid),
+        "accounts": gc.list_accounts(sid),
     }
 
 
 @app.get("/api/auth/login")
-async def login():
-    global _auth_flow
+async def login(request: Request):
     if not gc.has_credentials():
         raise HTTPException(
             status_code=400,
             detail="credentials.json not found. See README.",
         )
-    _auth_flow = gc.get_flow()
-    auth_url, _ = _auth_flow.authorization_url(
-        access_type="offline", prompt="consent"
-    )
+    sid = request.state.sid
+    flow = gc.get_flow()
+    _auth_flows[sid] = flow
+    auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
     return RedirectResponse(auth_url)
 
 
 @app.get("/api/auth/add-account")
-async def add_account_oauth():
-    global _auth_flow
+async def add_account_oauth(request: Request):
     if not gc.has_credentials():
         raise HTTPException(
             status_code=400,
             detail="credentials.json not found.",
         )
-    _auth_flow = gc.get_flow()
-    auth_url, _ = _auth_flow.authorization_url(
+    sid = request.state.sid
+    flow = gc.get_flow()
+    _auth_flows[sid] = flow
+    auth_url, _ = flow.authorization_url(
         access_type="offline", prompt="select_account consent"
     )
     return RedirectResponse(auth_url)
 
 
 @app.get("/api/auth/callback")
-async def auth_callback(code: str, state: Optional[str] = None):
-    global _auth_flow
-    if _auth_flow is None:
+async def auth_callback(request: Request, code: str, state: Optional[str] = None):
+    sid = request.state.sid
+    flow = _auth_flows.pop(sid, None)
+    if flow is None:
         raise HTTPException(
             status_code=400,
             detail="Auth session expired. Please click Connect again.",
         )
 
-    _auth_flow.fetch_token(code=code)
-    creds = _auth_flow.credentials
-    _auth_flow = None
+    flow.fetch_token(code=code)
+    creds = flow.credentials
 
     client_config = gc.credentials_config()
     config = client_config.get("web", client_config.get("installed", {}))
@@ -102,45 +122,47 @@ async def auth_callback(code: str, state: Optional[str] = None):
             detail="Could not retrieve account email from Google.",
         )
 
-    gc.save_credentials(
-        creds, config["client_id"], config["client_secret"], email
-    )
+    gc.save_credentials(sid, creds, config["client_id"], config["client_secret"], email)
     return RedirectResponse("/?connected=1")
 
 
 @app.post("/api/auth/switch/{email}")
-async def switch_account(email: str):
-    if email not in gc.list_accounts():
+async def switch_account(request: Request, email: str):
+    sid = request.state.sid
+    if email not in gc.list_accounts(sid):
         raise HTTPException(status_code=404, detail="Account not found.")
-    gc.set_current_account(email)
+    gc.set_current_account(sid, email)
     return {"status": "ok", "current_account": email}
 
 
 @app.delete("/api/auth/logout")
-async def logout():
-    current = gc.get_current_account()
+async def logout(request: Request):
+    sid = request.state.sid
+    current = gc.get_current_account(sid)
     if current:
-        tf = gc.token_file_path(current)
+        tf = gc.token_file_path(sid, current)
         if os.path.exists(tf):
             os.remove(tf)
-    remaining = gc.list_accounts()
+    remaining = gc.list_accounts(sid)
     if remaining:
-        gc.set_current_account(remaining[0])
+        gc.set_current_account(sid, remaining[0])
         return {"status": "ok", "next_account": remaining[0]}
-    if os.path.exists(gc.CURRENT_ACCOUNT_FILE):
-        os.remove(gc.CURRENT_ACCOUNT_FILE)
+    caf = os.path.join(gc.session_dir(sid), "current_account.json")
+    if os.path.exists(caf):
+        os.remove(caf)
     return {"status": "ok", "next_account": None}
 
 
-# ---------- Scan ----------
+# ── Scan ──────────────────────────────────────────────────────────────────────
 
 @app.post("/api/scan")
-async def scan():
-    service = gc.build_service()
+async def scan(request: Request):
+    sid = request.state.sid
+    service = gc.build_service(sid)
     if not service:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    account_email = gc.get_current_account() or ""
+    account_email = gc.get_current_account(sid) or ""
 
     # Catch bulk/marketing mail by the List-Id header (list:*) plus Gmail's
     # promotions category. This finds emails the plain "unsubscribe" keyword
@@ -162,11 +184,12 @@ async def scan():
                 break
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
     if not messages:
-        bounces = _reconcile_bounces(service, account_email)
+        bounces = _reconcile_bounces(service, sid, account_email)
         return {
             "found": 0,
-            "total": db.count_subscriptions(account_email),
+            "total": db.count_subscriptions(sid, account_email),
             "body_link_found": 0,
             "bounces_reconciled": bounces,
         }
@@ -220,7 +243,7 @@ async def scan():
 
         subject = headers.get("Subject", "(no subject)")
         if db.add_subscription(
-            account_email, sender_email, sender_name, subject, method, target
+            sid, account_email, sender_email, sender_name, subject, method, target
         ):
             found_new += 1
 
@@ -279,44 +302,47 @@ async def scan():
             continue
 
         if db.add_subscription(
-            account_email, sender_email, sender_name, subject,
+            sid, account_email, sender_email, sender_name, subject,
             "http_body", url,
         ):
             body_link_found += 1
 
-    bounces = _reconcile_bounces(service, account_email)
+    bounces = _reconcile_bounces(service, sid, account_email)
 
     return {
         "found": found_new + body_link_found,
-        "total": db.count_subscriptions(account_email),
+        "total": db.count_subscriptions(sid, account_email),
         "body_link_found": body_link_found,
         "bounces_reconciled": bounces,
     }
 
 
-# ---------- Emails / Stats ----------
+# ── Emails / Stats ────────────────────────────────────────────────────────────
 
 @app.get("/api/emails")
-async def get_emails():
-    account_email = gc.get_current_account() or ""
-    return {"emails": db.get_subscriptions(account_email)}
+async def get_emails(request: Request):
+    sid = request.state.sid
+    account_email = gc.get_current_account(sid) or ""
+    return {"emails": db.get_subscriptions(sid, account_email)}
 
 
 @app.get("/api/stats")
-async def get_stats():
-    account_email = gc.get_current_account() or ""
-    return db.get_stats(account_email)
+async def get_stats(request: Request):
+    sid = request.state.sid
+    account_email = gc.get_current_account(sid) or ""
+    return db.get_stats(sid, account_email)
 
 
-# ---------- Unsubscribe ----------
+# ── Unsubscribe ───────────────────────────────────────────────────────────────
 
 @app.post("/api/unsubscribe/{sub_id}")
-async def unsubscribe_one(sub_id: int):
-    service = gc.build_service()
+async def unsubscribe_one(request: Request, sub_id: int):
+    sid = request.state.sid
+    service = gc.build_service(sid)
     if not service:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    row = db.get_subscription(sub_id)
+    row = db.get_subscription(sid, sub_id)
     if not row:
         raise HTTPException(status_code=404, detail="Subscription not found")
 
@@ -334,13 +360,14 @@ async def unsubscribe_one(sub_id: int):
 
 
 @app.post("/api/unsubscribe-all")
-async def unsubscribe_all():
-    service = gc.build_service()
+async def unsubscribe_all(request: Request):
+    sid = request.state.sid
+    service = gc.build_service(sid)
     if not service:
         raise HTTPException(status_code=401, detail="Not authenticated")
 
-    account_email = gc.get_current_account() or ""
-    pending = db.get_subscriptions(account_email, status="pending")
+    account_email = gc.get_current_account(sid) or ""
+    pending = db.get_subscriptions(sid, account_email, status="pending")
     success_count, failed_count = 0, 0
 
     for row in pending:
@@ -359,7 +386,7 @@ async def unsubscribe_all():
     return {"success": success_count, "failed": failed_count}
 
 
-# ---------- Helpers ----------
+# ── Private helpers ───────────────────────────────────────────────────────────
 
 def _parse_from(from_header: str):
     match = re.match(r'"?([^"<]+?)"?\s*<([^>]+)>', from_header.strip())
@@ -389,7 +416,6 @@ def _send_unsubscribe_email(service, to_field: str):
         m = re.search(r"subject=([^&]+)", params, re.IGNORECASE)
         if m:
             subject = m.group(1).replace("%20", " ").replace("+", " ")
-
     msg = MIMEText("")
     msg["to"] = addr
     msg["subject"] = subject
@@ -414,7 +440,7 @@ def _http_unsubscribe(url: str):
     http_requests.get(url, headers=ua, timeout=15, allow_redirects=True)
 
 
-# ---------- Body-link parsing (Step 2) ----------
+# ── Body-link parsing (Pass 2) ────────────────────────────────────────────────
 
 _UNSUB_KEYWORDS = ("unsubscribe", "opt-out", "opt out", "退订", "取消订阅")
 
@@ -422,7 +448,7 @@ _UNSUB_KEYWORDS = ("unsubscribe", "opt-out", "opt out", "退订", "取消订阅"
 class _AnchorCollector(HTMLParser):
     def __init__(self):
         super().__init__()
-        self.anchors: list = []  # (href, text)
+        self.anchors: list = []
         self._href = None
         self._text: list = []
 
@@ -451,9 +477,7 @@ def _find_html_body(payload: dict) -> Optional[str]:
         data = payload.get("body", {}).get("data", "")
         if data:
             try:
-                return base64.urlsafe_b64decode(data).decode(
-                    "utf-8", errors="replace"
-                )
+                return base64.urlsafe_b64decode(data).decode("utf-8", errors="replace")
             except Exception:
                 return None
     for part in payload.get("parts", []) or []:
@@ -475,7 +499,6 @@ def _extract_unsub_link(html: str) -> Optional[str]:
         parser.feed(html)
     except Exception:
         return None
-
     for href, text in parser.anchors:
         if not href.lower().startswith(("http://", "https://")):
             continue
@@ -487,9 +510,9 @@ def _extract_unsub_link(html: str) -> Optional[str]:
     return None
 
 
-# ---------- Bounce reconciliation (Option B) ----------
+# ── Bounce reconciliation ─────────────────────────────────────────────────────
 
-def _reconcile_bounces(service, account_email: str) -> int:
+def _reconcile_bounces(service, session_id: str, account_email: str) -> int:
     """Find recent mailer-daemon bounces and flip matching mailto
     subscriptions from 'success' to 'failed'. Never adds new senders."""
     try:
@@ -533,7 +556,7 @@ def _reconcile_bounces(service, account_email: str) -> int:
 
     reconciled = 0
     for addr in failed_addrs:
-        for row in db.find_mailto_by_address(account_email, addr):
+        for row in db.find_mailto_by_address(session_id, account_email, addr):
             if row["status"] == "success":
                 db.update_status(
                     row["id"], "failed",
@@ -543,5 +566,5 @@ def _reconcile_bounces(service, account_email: str) -> int:
     return reconciled
 
 
-# Serve frontend (must be last)
+# Serve frontend (must be last — catches all unmatched paths)
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
