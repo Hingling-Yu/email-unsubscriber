@@ -27,6 +27,13 @@ async def startup():
     gc.migrate_legacy_token()
 
 
+# ---------- Status ----------
+
+@app.get("/api/status")
+async def app_status():
+    return {"credentials_configured": gc.has_credentials()}
+
+
 # ---------- Auth ----------
 
 @app.get("/api/auth/status")

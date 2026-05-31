@@ -27,10 +27,16 @@ def credentials_config() -> Optional[dict]:
     """Return OAuth client config from GOOGLE_CREDENTIALS_JSON env var or local file."""
     env_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if env_json:
-        return json.loads(env_json)
+        try:
+            return json.loads(env_json)
+        except (json.JSONDecodeError, ValueError):
+            pass
     if os.path.exists(CREDENTIALS_FILE):
-        with open(CREDENTIALS_FILE) as f:
-            return json.load(f)
+        try:
+            with open(CREDENTIALS_FILE) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
     return None
 
 

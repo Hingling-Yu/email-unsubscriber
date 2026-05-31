@@ -24,11 +24,14 @@ async function init() {
   if (params.has("connected")) window.history.replaceState({}, "", "/");
 
   try {
-    const status = await api("GET", "/auth/status");
-    if (!status.has_credentials) {
+    const sys = await api("GET", "/status");
+    if (!sys.credentials_configured) {
       showSetup(true);
-    } else if (status.authenticated) {
-      renderAccountSwitcher(status.accounts, status.current_account);
+      return;
+    }
+    const auth = await api("GET", "/auth/status");
+    if (auth.authenticated) {
+      renderAccountSwitcher(auth.accounts, auth.current_account);
       await showDashboard();
     } else {
       showSetup(false);
