@@ -1,0 +1,9 @@
+{
+  "name": "Email Unsubscriber",
+  "short_name": "Unsubscriber",
+  "description": "Find and unsubscribe from marketing emails in Gmail",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f4f5f9",
+  "theme_color": "#4f46e5"
+}

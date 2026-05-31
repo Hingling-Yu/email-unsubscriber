@@ -1,5 +1,4 @@
 import base64
-import json
 import os
 import re
 import time
@@ -32,7 +31,7 @@ async def startup():
 
 @app.get("/api/auth/status")
 async def auth_status():
-    has_creds = os.path.exists(gc.CREDENTIALS_FILE)
+    has_creds = gc.has_credentials()
     current = gc.get_current_account()
     creds = gc.load_credentials()
     return {
@@ -46,7 +45,7 @@ async def auth_status():
 @app.get("/api/auth/login")
 async def login():
     global _auth_flow
-    if not os.path.exists(gc.CREDENTIALS_FILE):
+    if not gc.has_credentials():
         raise HTTPException(
             status_code=400,
             detail="credentials.json not found. See README.",
@@ -61,7 +60,7 @@ async def login():
 @app.get("/api/auth/add-account")
 async def add_account_oauth():
     global _auth_flow
-    if not os.path.exists(gc.CREDENTIALS_FILE):
+    if not gc.has_credentials():
         raise HTTPException(
             status_code=400,
             detail="credentials.json not found.",
@@ -86,8 +85,7 @@ async def auth_callback(code: str, state: Optional[str] = None):
     creds = _auth_flow.credentials
     _auth_flow = None
 
-    with open(gc.CREDENTIALS_FILE) as f:
-        client_config = json.load(f)
+    client_config = gc.credentials_config()
     config = client_config.get("web", client_config.get("installed", {}))
 
     email = gc.get_account_email(creds)

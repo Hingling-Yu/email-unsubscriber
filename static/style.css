@@ -395,9 +395,64 @@ tr:hover td { background: var(--bg); }
 /* ── Utility ── */
 .hidden { display: none !important; }
 
-/* ── Responsive ── */
+/* Truncate long account emails in header */
+#current-account-label {
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Responsive: tablet ── */
 @media (max-width: 680px) {
   .stats-grid { grid-template-columns: repeat(2, 1fr); }
   .main { padding: 20px 16px; }
   .setup-card { padding: 36px 24px; }
+  .toolbar { flex-direction: column; align-items: flex-start; gap: 10px; }
+  .toolbar-left { flex-wrap: wrap; }
+  /* Touch-friendly tap targets */
+  .btn { min-height: 44px; }
+  .btn-sm { min-height: 40px; padding: 8px 14px; }
+  .btn-lg { min-height: 48px; }
+}
+
+/* ── Responsive: mobile card layout (≤520px) ── */
+@media (max-width: 520px) {
+  .header { padding: 0 14px; }
+  #current-account-label { max-width: 120px; }
+  .main { padding: 14px 12px; }
+  .setup-card { padding: 28px 18px; }
+  .stat-card { padding: 16px 14px; }
+  .stat-num { font-size: 24px; }
+
+  /* Transform table rows into stacked cards */
+  #email-table { display: block; }
+  #email-table thead { display: none; }
+  #email-table tbody { display: block; }
+
+  #email-table tr {
+    display: grid;
+    grid-template-areas:
+      "sender  status"
+      "subject subject"
+      "method  action";
+    grid-template-columns: 1fr auto;
+    gap: 6px 12px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border-light);
+  }
+  #email-table tr:last-child { border-bottom: none; }
+  #email-table tr:hover td { background: transparent; }
+
+  #email-table td { display: block; padding: 0; border: none; }
+  #email-table td:nth-child(1) { grid-area: sender; }
+  #email-table td:nth-child(2) { grid-area: subject; }
+  #email-table td:nth-child(2) .subject {
+    max-width: 100%;
+    white-space: normal;
+    overflow: visible;
+  }
+  #email-table td:nth-child(3) { grid-area: method; align-self: center; }
+  #email-table td:nth-child(4) { grid-area: status; justify-self: end; }
+  #email-table td:nth-child(5) { grid-area: action; justify-self: end; align-self: center; }
 }

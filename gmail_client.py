@@ -14,13 +14,32 @@ SCOPES = [
 ]
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.environ.get("DATA_DIR", BASE_DIR)
+
 CREDENTIALS_FILE = os.path.join(BASE_DIR, "credentials.json")
-CURRENT_ACCOUNT_FILE = os.path.join(BASE_DIR, "current_account.json")
-REDIRECT_URI = "http://localhost:8000/api/auth/callback"
+CURRENT_ACCOUNT_FILE = os.path.join(DATA_DIR, "current_account.json")
+REDIRECT_URI = os.environ.get(
+    "OAUTH_REDIRECT_URI", "http://localhost:8000/api/auth/callback"
+)
+
+
+def credentials_config() -> Optional[dict]:
+    """Return OAuth client config from GOOGLE_CREDENTIALS_JSON env var or local file."""
+    env_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+    if env_json:
+        return json.loads(env_json)
+    if os.path.exists(CREDENTIALS_FILE):
+        with open(CREDENTIALS_FILE) as f:
+            return json.load(f)
+    return None
+
+
+def has_credentials() -> bool:
+    return credentials_config() is not None
 
 
 def token_file_path(email: str) -> str:
-    return os.path.join(BASE_DIR, f"token_{email}.json")
+    return os.path.join(DATA_DIR, f"token_{email}.json")
 
 
 def get_current_account() -> Optional[str]:
@@ -31,24 +50,26 @@ def get_current_account() -> Optional[str]:
 
 
 def set_current_account(email: str):
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(CURRENT_ACCOUNT_FILE, "w") as f:
         json.dump({"email": email}, f)
 
 
 def list_accounts() -> List[str]:
+    if not os.path.isdir(DATA_DIR):
+        return []
     return sorted(
         fname[6:-5]
-        for fname in os.listdir(BASE_DIR)
+        for fname in os.listdir(DATA_DIR)
         if fname.startswith("token_") and fname.endswith(".json")
     )
 
 
 def get_flow() -> Flow:
-    return Flow.from_client_secrets_file(
-        CREDENTIALS_FILE,
-        scopes=SCOPES,
-        redirect_uri=REDIRECT_URI,
-    )
+    config = credentials_config()
+    if config is None:
+        raise RuntimeError("No OAuth credentials configured.")
+    return Flow.from_client_config(config, scopes=SCOPES, redirect_uri=REDIRECT_URI)
 
 
 def load_credentials(email: Optional[str] = None) -> Optional[Credentials]:
@@ -83,6 +104,7 @@ def load_credentials(email: Optional[str] = None) -> Optional[Credentials]:
 def save_credentials(
     creds: Credentials, client_id: str, client_secret: str, email: str
 ):
+    os.makedirs(DATA_DIR, exist_ok=True)
     with open(token_file_path(email), "w") as f:
         json.dump(
             {

@@ -4,7 +4,8 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 DB_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "subscriptions.db"
+    os.environ.get("DATA_DIR", os.path.dirname(os.path.abspath(__file__))),
+    "subscriptions.db",
 )
 
 
